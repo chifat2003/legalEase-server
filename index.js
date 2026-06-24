@@ -39,7 +39,7 @@ async function run() {
 
     const database = client.db("assignment-10-db");
     const addNewService = database.collection("new-service");
-    app.post('/add-new-service', async (req, res) => {
+    app.post('/api/add-new-service', async (req, res) => {
       const newService = req.body;
       const result = await addNewService.insertOne(newService);
       res.send(result);
