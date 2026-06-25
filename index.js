@@ -3,6 +3,7 @@ const cors = require('cors');
 const app = express();
 const port = process.env.PORT || 5000;
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const adminRoutes = require('./admin-routes');
 
 require('dotenv').config();
 
@@ -112,6 +113,151 @@ async function run() {
       const query = { _id: new ObjectId(id) };
       const result = await addNewService.deleteOne(query);
       res.send(result);
+    });
+
+    // ── ADMIN routes ────────────────────────────────────────────────────────
+
+    // Get admin statistics
+    app.get('/api/admin/stats', verifySession, requireRole('admin'), async (req, res) => {
+      try {
+        const totalUsers = await usersCollection.countDocuments();
+        const totalLawyers = await usersCollection.countDocuments({ role: 'lawyer' });
+        const totalAdmins = await usersCollection.countDocuments({ role: 'admin' });
+        const blockedUsers = await usersCollection.countDocuments({ isBlocked: true });
+        const totalServices = await addNewService.countDocuments();
+
+        // Get transactions stats
+        const transactionsCollection = database.collection('transactions');
+        const transactionStats = await transactionsCollection
+          .aggregate([
+            {
+              $group: {
+                _id: null,
+                totalTransactions: { $sum: 1 },
+                totalRevenue: { $sum: '$amount' },
+              },
+            },
+          ])
+          .toArray();
+
+        const totalTransactions = transactionStats[0]?.totalTransactions || 0;
+        const totalRevenue = transactionStats[0]?.totalRevenue || 0;
+
+        res.json({
+          totalUsers,
+          totalLawyers,
+          totalAdmins,
+          blockedUsers,
+          totalServices,
+          totalTransactions,
+          totalRevenue,
+        });
+      } catch (err) {
+        console.error('Error fetching admin stats:', err);
+        res.status(500).json({ error: 'Internal server error' });
+      }
+    });
+
+    // Set user role (admin only)
+    app.post('/api/admin/set-role', verifySession, requireRole('admin'), async (req, res) => {
+      const { userId, role } = req.body;
+
+      if (!userId || !role) {
+        return res.status(400).json({ error: 'userId and role are required' });
+      }
+
+      const validRoles = ['user', 'lawyer', 'admin'];
+      if (!validRoles.includes(role)) {
+        return res.status(400).json({ error: 'Invalid role' });
+      }
+
+      try {
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          { $set: { role } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.json({ success: true, message: `User role updated to ${role}` });
+      } catch (err) {
+        console.error('Error updating user role:', err);
+        res.status(500).json({ error: 'Internal server error' });
+      }
+    });
+
+    // Block/Unblock user (admin only)
+    app.post('/api/admin/toggle-block', verifySession, requireRole('admin'), async (req, res) => {
+      const { userId, isBlocked } = req.body;
+
+      if (!userId || isBlocked === undefined) {
+        return res.status(400).json({ error: 'userId and isBlocked are required' });
+      }
+
+      try {
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          { $set: { isBlocked } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.json({ 
+          success: true, 
+          message: `User ${isBlocked ? 'blocked' : 'unblocked'} successfully` 
+        });
+      } catch (err) {
+        console.error('Error updating user block status:', err);
+        res.status(500).json({ error: 'Internal server error' });
+      }
+    });
+
+    // Get all users (admin only)
+    app.get('/api/admin/users', verifySession, requireRole('admin'), async (req, res) => {
+      try {
+        const users = await usersCollection.find({}, { projection: { password: 0 } }).toArray();
+        res.json(users);
+      } catch (err) {
+        console.error('Error fetching users:', err);
+        res.status(500).json({ error: 'Internal server error' });
+      }
+    });
+
+    // Get all transactions (admin only)
+    app.get('/api/admin/transactions', verifySession, requireRole('admin'), async (req, res) => {
+      try {
+        const transactionsCollection = database.collection('transactions');
+        const transactions = await transactionsCollection
+          .find({})
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        const serialized = transactions.map((t) => ({
+          id: t._id.toString(),
+          hiringId: t.hiringId,
+          stripePaymentIntentId: t.stripePaymentIntentId,
+          userId: t.userId,
+          userEmail: t.userEmail,
+          lawyerId: t.lawyerId,
+          lawyerEmail: t.lawyerEmail,
+          lawyerName: t.lawyerName,
+          amount: t.amount,
+          currency: t.currency || 'usd',
+          serviceName: t.serviceName,
+          specialization: t.specialization,
+          status: t.status,
+          createdAt: t.createdAt?.toISOString?.() || t.createdAt,
+        }));
+
+        res.json(serialized);
+      } catch (err) {
+        console.error('Error fetching transactions:', err);
+        res.status(500).json({ error: 'Internal server error' });
+      }
     });
 
     await client.db("admin").command({ ping: 1 });
