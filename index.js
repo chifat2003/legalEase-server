@@ -7,9 +7,18 @@ const adminRoutes = require('./admin-routes');
 
 require('dotenv').config();
 
-// ── CORS: allow credentials so the session cookie is forwarded ─────────────
+//   FRONTEND_URL=https://app.example.com,https://staging.example.com
+const allowedOrigins = process.env.FRONTEND_URL
+  ? process.env.FRONTEND_URL.split(',').map((u) => u.trim()).filter(Boolean)
+  : [];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: (origin, callback) => {
+    // Allow requests with no origin (e.g. server-to-server, curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin '${origin}' not allowed`));
+  },
   credentials: true,
 }));
 app.use(express.json());
@@ -41,28 +50,41 @@ async function verifySession(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized — no session cookie' });
   }
 
-  try {
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    const resp = await fetch(`${frontendUrl}/api/auth/get-session`, {
-      headers: { cookie: cookieHeader },
-    });
-
-    if (!resp.ok) {
-      return res.status(401).json({ error: 'Unauthorized — session invalid' });
-    }
-
-    const session = await resp.json();
-
-    if (!session?.user) {
-      return res.status(401).json({ error: 'Unauthorized — no user in session' });
-    }
-
-    req.user = session.user;
-    next();
-  } catch (err) {
-    console.error('Session verification error:', err);
-    res.status(500).json({ error: 'Auth check failed' });
+  if (allowedOrigins.length === 0) {
+    return res.status(500).json({ error: 'Server misconfiguration — FRONTEND_URL is not set' });
   }
+
+  // Try each allowed origin until one returns a valid session.
+  // This supports multi-environment deploys where the request may come
+  // from any of the configured frontend URLs.
+  let session = null;
+  let lastError = null;
+
+  for (const frontendUrl of allowedOrigins) {
+    try {
+      const resp = await fetch(`${frontendUrl}/api/auth/get-session`, {
+        headers: { cookie: cookieHeader },
+      });
+
+      if (!resp.ok) continue;
+
+      const data = await resp.json();
+      if (data?.user) {
+        session = data;
+        break;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  if (!session?.user) {
+    if (lastError) console.error('Session verification error:', lastError);
+    return res.status(401).json({ error: 'Unauthorized — session invalid' });
+  }
+
+  req.user = session.user;
+  next();
 }
 
 // Role-based middleware helpers
