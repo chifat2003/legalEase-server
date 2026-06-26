@@ -1,62 +1,62 @@
-const express = require('express');
-const cors = require('cors');
+const express = require("express");
+const cors = require("cors");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+require("dotenv").config();
+
 const app = express();
 const port = process.env.PORT || 5000;
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const adminRoutes = require('./admin-routes');
 
-require('dotenv').config();
-
-//   FRONTEND_URL=https://app.example.com,https://staging.example.com
+// -- CORS ---------------------------------------------------------------------
 const allowedOrigins = process.env.FRONTEND_URL
-  ? process.env.FRONTEND_URL.split(',').map((u) => u.trim()).filter(Boolean)
+  ? process.env.FRONTEND_URL.split(",").map((u) => u.trim()).filter(Boolean)
   : [];
 
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (e.g. server-to-server, curl)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    callback(new Error(`CORS: origin '${origin}' not allowed`));
-  },
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      callback(new Error(`CORS: origin "${origin}" not allowed`));
+    },
+    credentials: true,
+  })
+);
 app.use(express.json());
 
-app.get('/', (req, res) => {
-  res.send('LegalEase API is running!');
-});
-
+// -- MongoDB (lazy singleton) --------------------------------------------------
 const uri = process.env.MONGODB_URI;
-
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
-  }
+  },
 });
 
-// ── Auth middleware ─────────────────────────────────────────────────────────
-// Verifies the better-auth session by calling the Next.js auth API.
-// Attaches req.user on success, returns 401 on failure.
+let isConnected = false;
+async function getDb() {
+  if (!isConnected) {
+    await client.connect();
+    isConnected = true;
+  }
+  return client.db("assignment-10-db");
+}
+
+// -- Auth middleware -----------------------------------------------------------
 async function verifySession(req, res, next) {
-  const cookieHeader = req.headers['cookie'] || '';
+  const cookieHeader = req.headers["cookie"] || "";
   const sessionTokenMatch =
     cookieHeader.match(/better-auth\.session_token=([^;]+)/) ||
     cookieHeader.match(/__Secure-better-auth\.session_token=([^;]+)/);
 
   if (!sessionTokenMatch) {
-    return res.status(401).json({ error: 'Unauthorized — no session cookie' });
+    return res.status(401).json({ error: "Unauthorized - no session cookie" });
   }
 
   if (allowedOrigins.length === 0) {
-    return res.status(500).json({ error: 'Server misconfiguration — FRONTEND_URL is not set' });
+    return res.status(500).json({ error: "Server misconfiguration - FRONTEND_URL is not set" });
   }
 
-  // Try each allowed origin until one returns a valid session.
-  // This supports multi-environment deploys where the request may come
-  // from any of the configured frontend URLs.
   let session = null;
   let lastError = null;
 
@@ -65,231 +65,180 @@ async function verifySession(req, res, next) {
       const resp = await fetch(`${frontendUrl}/api/auth/get-session`, {
         headers: { cookie: cookieHeader },
       });
-
       if (!resp.ok) continue;
-
       const data = await resp.json();
-      if (data?.user) {
-        session = data;
-        break;
-      }
+      if (data?.user) { session = data; break; }
     } catch (err) {
       lastError = err;
     }
   }
 
   if (!session?.user) {
-    if (lastError) console.error('Session verification error:', lastError);
-    return res.status(401).json({ error: 'Unauthorized — session invalid' });
+    if (lastError) console.error("Session verification error:", lastError);
+    return res.status(401).json({ error: "Unauthorized - session invalid" });
   }
 
   req.user = session.user;
   next();
 }
 
-// Role-based middleware helpers
 function requireRole(...roles) {
   return (req, res, next) => {
-    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ error: `Forbidden — requires role: ${roles.join(' or ')}` });
+      return res.status(403).json({ error: `Forbidden - requires role: ${roles.join(" or ")}` });
     }
     next();
   };
 }
 
-async function run() {
+// -- PUBLIC routes -------------------------------------------------------------
+app.get("/", (req, res) => res.send("LegalEase API is running!"));
+
+app.get("/api/users", async (req, res) => {
   try {
-    await client.connect();
-
-    const database = client.db("assignment-10-db");
-    const addNewService = database.collection("new-service");
-    const usersCollection = database.collection("user");
-
-    // ── PUBLIC routes ───────────────────────────────────────────────────────
-
-    // Anyone can browse services and lawyers
-    app.get('/api/services', async (req, res) => {
-      const result = await addNewService.find().toArray();
-      res.send(result);
-    });
-
-    // Anyone can see users list (for browsing lawyers on the public page)
-    app.get('/api/users', async (req, res) => {
-      const result = await usersCollection.find().toArray();
-      res.send(result);
-    });
-
-    // ── PROTECTED routes — must be authenticated ────────────────────────────
-
-    // Only lawyers can add a service
-    app.post('/api/add-new-service', verifySession, requireRole('lawyer', 'admin'), async (req, res) => {
-      const newService = req.body;
-      const result = await addNewService.insertOne(newService);
-      res.send(result);
-    });
-
-    // Only admins or the owning lawyer can delete a service
-    app.delete('/api/services/:id', verifySession, requireRole('admin', 'lawyer'), async (req, res) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-      const result = await addNewService.deleteOne(query);
-      res.send(result);
-    });
-
-    // ── ADMIN routes ────────────────────────────────────────────────────────
-
-    // Get admin statistics
-    app.get('/api/admin/stats', verifySession, requireRole('admin'), async (req, res) => {
-      try {
-        const totalUsers = await usersCollection.countDocuments();
-        const totalLawyers = await usersCollection.countDocuments({ role: 'lawyer' });
-        const totalAdmins = await usersCollection.countDocuments({ role: 'admin' });
-        const blockedUsers = await usersCollection.countDocuments({ isBlocked: true });
-        const totalServices = await addNewService.countDocuments();
-
-        // Get transactions stats
-        const transactionsCollection = database.collection('transactions');
-        const transactionStats = await transactionsCollection
-          .aggregate([
-            {
-              $group: {
-                _id: null,
-                totalTransactions: { $sum: 1 },
-                totalRevenue: { $sum: '$amount' },
-              },
-            },
-          ])
-          .toArray();
-
-        const totalTransactions = transactionStats[0]?.totalTransactions || 0;
-        const totalRevenue = transactionStats[0]?.totalRevenue || 0;
-
-        res.json({
-          totalUsers,
-          totalLawyers,
-          totalAdmins,
-          blockedUsers,
-          totalServices,
-          totalTransactions,
-          totalRevenue,
-        });
-      } catch (err) {
-        console.error('Error fetching admin stats:', err);
-        res.status(500).json({ error: 'Internal server error' });
-      }
-    });
-
-    // Set user role (admin only)
-    app.post('/api/admin/set-role', verifySession, requireRole('admin'), async (req, res) => {
-      const { userId, role } = req.body;
-
-      if (!userId || !role) {
-        return res.status(400).json({ error: 'userId and role are required' });
-      }
-
-      const validRoles = ['user', 'lawyer', 'admin'];
-      if (!validRoles.includes(role)) {
-        return res.status(400).json({ error: 'Invalid role' });
-      }
-
-      try {
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(userId) },
-          { $set: { role } }
-        );
-
-        if (result.matchedCount === 0) {
-          return res.status(404).json({ error: 'User not found' });
-        }
-
-        res.json({ success: true, message: `User role updated to ${role}` });
-      } catch (err) {
-        console.error('Error updating user role:', err);
-        res.status(500).json({ error: 'Internal server error' });
-      }
-    });
-
-    // Block/Unblock user (admin only)
-    app.post('/api/admin/toggle-block', verifySession, requireRole('admin'), async (req, res) => {
-      const { userId, isBlocked } = req.body;
-
-      if (!userId || isBlocked === undefined) {
-        return res.status(400).json({ error: 'userId and isBlocked are required' });
-      }
-
-      try {
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(userId) },
-          { $set: { isBlocked } }
-        );
-
-        if (result.matchedCount === 0) {
-          return res.status(404).json({ error: 'User not found' });
-        }
-
-        res.json({ 
-          success: true, 
-          message: `User ${isBlocked ? 'blocked' : 'unblocked'} successfully` 
-        });
-      } catch (err) {
-        console.error('Error updating user block status:', err);
-        res.status(500).json({ error: 'Internal server error' });
-      }
-    });
-
-    // Get all users (admin only)
-    app.get('/api/admin/users', verifySession, requireRole('admin'), async (req, res) => {
-      try {
-        const users = await usersCollection.find({}, { projection: { password: 0 } }).toArray();
-        res.json(users);
-      } catch (err) {
-        console.error('Error fetching users:', err);
-        res.status(500).json({ error: 'Internal server error' });
-      }
-    });
-
-    // Get all transactions (admin only)
-    app.get('/api/admin/transactions', verifySession, requireRole('admin'), async (req, res) => {
-      try {
-        const transactionsCollection = database.collection('transactions');
-        const transactions = await transactionsCollection
-          .find({})
-          .sort({ createdAt: -1 })
-          .toArray();
-
-        const serialized = transactions.map((t) => ({
-          id: t._id.toString(),
-          hiringId: t.hiringId,
-          stripePaymentIntentId: t.stripePaymentIntentId,
-          userId: t.userId,
-          userEmail: t.userEmail,
-          lawyerId: t.lawyerId,
-          lawyerEmail: t.lawyerEmail,
-          lawyerName: t.lawyerName,
-          amount: t.amount,
-          currency: t.currency || 'usd',
-          serviceName: t.serviceName,
-          specialization: t.specialization,
-          status: t.status,
-          createdAt: t.createdAt?.toISOString?.() || t.createdAt,
-        }));
-
-        res.json(serialized);
-      } catch (err) {
-        console.error('Error fetching transactions:', err);
-        res.status(500).json({ error: 'Internal server error' });
-      }
-    });
-
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-  } finally {
-    // await client.close();
+    const db = await getDb();
+    const result = await db.collection("user").find().toArray();
+    res.send(result);
+  } catch (err) {
+    console.error("Error fetching users:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
-}
-run().catch(console.dir);
-
-app.listen(port, () => {
-  console.log(`LegalEase API listening on port ${port}`);
 });
+
+app.get("/api/services", async (req, res) => {
+  try {
+    const db = await getDb();
+    const result = await db.collection("new-service").find().toArray();
+    res.send(result);
+  } catch (err) {
+    console.error("Error fetching services:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// -- PROTECTED routes ----------------------------------------------------------
+app.post("/api/add-new-service", verifySession, requireRole("lawyer", "admin"), async (req, res) => {
+  try {
+    const db = await getDb();
+    const result = await db.collection("new-service").insertOne(req.body);
+    res.send(result);
+  } catch (err) {
+    console.error("Error adding service:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/services/:id", verifySession, requireRole("admin", "lawyer"), async (req, res) => {
+  try {
+    const db = await getDb();
+    const result = await db.collection("new-service").deleteOne({ _id: new ObjectId(req.params.id) });
+    res.send(result);
+  } catch (err) {
+    console.error("Error deleting service:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// -- ADMIN routes --------------------------------------------------------------
+app.get("/api/admin/stats", verifySession, requireRole("admin"), async (req, res) => {
+  try {
+    const db = await getDb();
+    const usersCollection = db.collection("user");
+    const transactionsCollection = db.collection("transactions");
+
+    const [totalUsers, totalLawyers, totalAdmins, blockedUsers, totalServices, transactionStats] =
+      await Promise.all([
+        usersCollection.countDocuments(),
+        usersCollection.countDocuments({ role: "lawyer" }),
+        usersCollection.countDocuments({ role: "admin" }),
+        usersCollection.countDocuments({ isBlocked: true }),
+        db.collection("new-service").countDocuments(),
+        transactionsCollection.aggregate([{ $group: { _id: null, totalTransactions: { $sum: 1 }, totalRevenue: { $sum: "$amount" } } }]).toArray(),
+      ]);
+
+    res.json({
+      totalUsers,
+      totalLawyers,
+      totalAdmins,
+      blockedUsers,
+      totalServices,
+      totalTransactions: transactionStats[0]?.totalTransactions || 0,
+      totalRevenue: transactionStats[0]?.totalRevenue || 0,
+    });
+  } catch (err) {
+    console.error("Error fetching admin stats:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/admin/set-role", verifySession, requireRole("admin"), async (req, res) => {
+  const { userId, role } = req.body;
+  if (!userId || !role) return res.status(400).json({ error: "userId and role are required" });
+  const validRoles = ["user", "lawyer", "admin"];
+  if (!validRoles.includes(role)) return res.status(400).json({ error: "Invalid role" });
+  try {
+    const db = await getDb();
+    const result = await db.collection("user").updateOne({ _id: new ObjectId(userId) }, { $set: { role } });
+    if (result.matchedCount === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ success: true, message: `User role updated to ${role}` });
+  } catch (err) {
+    console.error("Error updating user role:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/admin/toggle-block", verifySession, requireRole("admin"), async (req, res) => {
+  const { userId, isBlocked } = req.body;
+  if (!userId || isBlocked === undefined) return res.status(400).json({ error: "userId and isBlocked are required" });
+  try {
+    const db = await getDb();
+    const result = await db.collection("user").updateOne({ _id: new ObjectId(userId) }, { $set: { isBlocked } });
+    if (result.matchedCount === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ success: true, message: `User ${isBlocked ? "blocked" : "unblocked"} successfully` });
+  } catch (err) {
+    console.error("Error updating user block status:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/admin/users", verifySession, requireRole("admin"), async (req, res) => {
+  try {
+    const db = await getDb();
+    const users = await db.collection("user").find({}, { projection: { password: 0 } }).toArray();
+    res.json(users);
+  } catch (err) {
+    console.error("Error fetching users:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/admin/transactions", verifySession, requireRole("admin"), async (req, res) => {
+  try {
+    const db = await getDb();
+    const transactions = await db.collection("transactions").find({}).sort({ createdAt: -1 }).toArray();
+    res.json(transactions.map((t) => ({
+      id: t._id.toString(),
+      hiringId: t.hiringId,
+      stripePaymentIntentId: t.stripePaymentIntentId,
+      userId: t.userId,
+      userEmail: t.userEmail,
+      lawyerId: t.lawyerId,
+      lawyerEmail: t.lawyerEmail,
+      lawyerName: t.lawyerName,
+      amount: t.amount,
+      currency: t.currency || "usd",
+      serviceName: t.serviceName,
+      specialization: t.specialization,
+      status: t.status,
+      createdAt: t.createdAt?.toISOString?.() || t.createdAt,
+    })));
+  } catch (err) {
+    console.error("Error fetching transactions:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.listen(port, () => console.log(`LegalEase API listening on port ${port}`));
+
+module.exports = app;
